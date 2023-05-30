@@ -15,6 +15,10 @@
 #include <IO/WriteHelpers.h>
 #include "config_version.h"
 
+#if USE_SNAPPY
+#include <snappy.h>
+#endif
+
 namespace DB::ErrorCodes
 {
     extern const int CANNOT_COMPRESS;
@@ -93,7 +97,7 @@ struct StatisticsFixedString
 
     void clear() { min = max = nullptr; }
 
-    parq::Statistics get(const WriteOptions & options)
+    parq::Statistics get(const WriteOptions & options) const
     {
         parq::Statistics s;
         if (min == nullptr || fixed_string_size > options.max_statistics_size)
@@ -136,7 +140,7 @@ struct StatisticsString
 
     void clear() { *this = {}; }
 
-    parq::Statistics get(const WriteOptions & options)
+    parq::Statistics get(const WriteOptions & options) const
     {
         parq::Statistics s;
         if (min.ptr == nullptr)
@@ -197,7 +201,7 @@ struct ConverterNumeric
         {
             buf.resize(count);
             for (size_t i = 0; i < count; ++i)
-                buf[i] = static_cast<To>(column.getData()[offset + i]);
+                buf[i] = static_cast<To>(column.getData()[offset + i]); // NOLINT
             return buf.data();
         }
     }
@@ -348,6 +352,24 @@ PODArray<char> & compress(PODArray<char> & source, PODArray<char> & scratch, Com
             return scratch;
         }
 
+#if USE_SNAPPY
+        case CompressionMethod::Snappy:
+        {
+            size_t max_dest_size = snappy::MaxCompressedLength(source.size());
+
+            if (max_dest_size > std::numeric_limits<int>::max())
+                throw Exception(ErrorCodes::CANNOT_COMPRESS, "Cannot compress column of size {}", formatReadableSizeWithBinarySuffix(source.size()));
+
+            scratch.resize(max_dest_size);
+
+            size_t compressed_size;
+            snappy::RawCompress(source.data(), source.size(), scratch.data(), &compressed_size);
+
+            scratch.resize(static_cast<size_t>(compressed_size));
+            return scratch;
+        }
+#endif
+
         default:
         {
             auto dest_buf = std::make_unique<WriteBufferFromVector<PODArray<char>>>(scratch);
@@ -421,7 +443,7 @@ void writeColumnImpl(
     typename Converter::Statistics page_statistics;
     typename Converter::Statistics total_statistics;
 
-    bool use_dictionary = options.use_dictionary_encoding;
+    bool use_dictionary = options.use_dictionary_encoding && !s.is_bool;
 
     std::optional<parquet::ColumnDescriptor> fixed_string_descr;
     if constexpr (std::is_same<ParquetDType, parquet::FLBAType>::value)
@@ -605,6 +627,13 @@ void writeColumnImpl(
                 data_offset = 0;
                 dict_encoded_pages.clear();
                 use_dictionary = false;
+
+#ifndef NDEBUG
+                /// Arrow's DictEncoderImpl destructor asserts that FlushValues() was called, so we
+                /// call it even though we don't need its output.
+                encoder->FlushValues();
+#endif
+
                 encoder = parquet::MakeTypedEncoder<ParquetDType>(
                     static_cast<parquet::Encoding::type>(encoding));
                 break;
@@ -668,7 +697,13 @@ void writeColumnChunkBody(ColumnChunkWriteState & s, const WriteOptions & option
                 ConverterNumeric<ColumnVector<source_type>, parquet::parquet_dtype::c_type>( \
                     s.primitive_column))
 
-        case TypeIndex::UInt8  : N(UInt8 , Int32Type); break;
+        case TypeIndex::UInt8:
+            if (s.is_bool)
+                writeColumnImpl<parquet::BooleanType>(s, options, out,
+                    ConverterNumeric<ColumnVector<UInt8>, bool, bool>(s.primitive_column));
+            else
+                N(UInt8 , Int32Type);
+         break;
         case TypeIndex::UInt16 : N(UInt16, Int32Type); break;
         case TypeIndex::UInt32 : N(UInt32, Int32Type); break;
         case TypeIndex::UInt64 : N(UInt64, Int64Type); break;
@@ -769,14 +804,14 @@ parq::ColumnChunk finalizeColumnChunkAndWriteFooter(
 
     serializeThriftStruct(s.column_chunk, out);
 
-    return std::move(s.column_chunk);
+    return s.column_chunk;
 }
 
 parq::RowGroup makeRowGroup(std::vector<parq::ColumnChunk> column_chunks, size_t num_rows)
 {
     parq::RowGroup r;
     r.__set_num_rows(num_rows);
-    r.__set_columns(std::move(column_chunks));
+    r.__set_columns(column_chunks);
     r.__set_total_compressed_size(0);
     for (auto & c : r.columns)
     {
