@@ -240,3 +240,5 @@ extern MemoryTracker total_memory_tracker;
 extern MemoryTracker background_memory_tracker;
 
 bool canEnqueueBackgroundTask();
+
+UInt64 getJeMallocValue(const char * name);

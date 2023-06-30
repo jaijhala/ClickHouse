@@ -540,3 +540,19 @@ bool canEnqueueBackgroundTask()
     auto amount = background_memory_tracker.get();
     return limit == 0 || amount < limit;
 }
+
+#if USE_JEMALLOC
+UInt64 getJeMallocValue(const char * name)
+{
+    UInt64 value{};
+    size_t size = sizeof(value);
+    mallctl(name, &value, &size, nullptr, 0);
+    return value;
+}
+#else
+UInt64 getJeMallocValue(const char *)
+{
+    return 0;
+}
+#endif
+
